@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bytes = "1.2.1"
 num_enum = "0.5.7"
-rkyv = "0.7.39"
+rkyv = { version = "0.7.39", features = ["validation"] }
 tokio = { version = "1.20.1", features = ["full"] }
 webrtc-sctp = "0.6.0"
 webrtc-util = "0.5.4"

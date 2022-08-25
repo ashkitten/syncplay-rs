@@ -447,7 +447,6 @@ dependencies = [
 name = "syncplay-rs"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "num_enum",
  "rkyv",
  "tokio",
