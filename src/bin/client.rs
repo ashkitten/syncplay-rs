@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
-use syncplay_rs::{Packet, StreamId};
+use syncplay_rs::{Packet, StreamId, TimeSyncer};
 use tokio::{net::UdpSocket, process::Command, sync::RwLock, time};
 use webrtc_sctp::{
     association::{Association, Config},
@@ -38,8 +38,7 @@ async fn main() -> io::Result<()> {
 
 struct Client {
     association: Association,
-    start: Instant,
-    start_offset: Duration,
+    syncer: Arc<RwLock<TimeSyncer>>,
     playback_elapsed: Arc<RwLock<Duration>>,
 }
 
@@ -59,8 +58,7 @@ impl Client {
 
         Ok(Self {
             association,
-            start: Instant::now(),
-            start_offset: SystemTime::UNIX_EPOCH.elapsed().unwrap(),
+            syncer: Arc::new(RwLock::new(TimeSyncer::new())),
             playback_elapsed: Arc::new(RwLock::new(Duration::ZERO)),
         })
     }
@@ -77,7 +75,7 @@ impl Client {
         Packet::Version(69).write_into(&mut poll_stream).await?;
 
         let packet = Packet::PlaybackControl {
-            timestamp: self.start_offset + self.start.elapsed(),
+            timestamp: self.syncer.read().await.now(),
             paused: false,
             elapsed: Duration::ZERO,
         };
@@ -106,18 +104,35 @@ impl Client {
         let mut poll_stream = PollStream::new(Arc::clone(&stream));
         println!("sync stream opened");
 
+        {
+            let mut poll_stream = PollStream::new(Arc::clone(&stream));
+            let syncer = Arc::clone(&self.syncer);
+            tokio::spawn(async move {
+                loop {
+                    syncer.write().await.start_sync();
+                    Packet::TimeSyncRequest
+                        .write_into(&mut poll_stream)
+                        .await
+                        .unwrap();
+                    time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+        }
+
         loop {
             while let Ok(packet) = Packet::read_from(&mut poll_stream).await {
                 match packet {
                     Packet::PlaybackUpdate { timestamp, elapsed } => {
-                        let client_timestamp = self.start_offset + self.start.elapsed();
-                        let latency = client_timestamp - timestamp;
+                        let latency = self.syncer.read().await.since(timestamp);
                         dbg!(latency);
 
                         let drift_ms: i128 = (elapsed - *self.playback_elapsed.read().await
                             + latency)
                             .as_millis() as i128;
                         dbg!(drift_ms);
+                    }
+                    Packet::TimeSyncResponse(resp_time) => {
+                        self.syncer.write().await.finish_sync(resp_time);
                     }
                     _ => (),
                 }

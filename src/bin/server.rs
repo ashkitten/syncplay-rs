@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
-use syncplay_rs::{Packet, StreamId};
+use syncplay_rs::{Packet, StreamId, TimeSyncer};
 use tokio::{net::UdpSocket, sync::RwLock, time};
 use webrtc_sctp::{
     association::{Association, Config},
@@ -38,8 +38,7 @@ async fn main() -> io::Result<()> {
 
 struct Server {
     association: Association,
-    start: Instant,
-    start_offset: Duration,
+    syncer: Arc<RwLock<TimeSyncer>>,
     playback_start: Arc<RwLock<Instant>>,
 }
 
@@ -59,8 +58,7 @@ impl Server {
 
         Ok(Self {
             association,
-            start: Instant::now(),
-            start_offset: SystemTime::UNIX_EPOCH.elapsed().unwrap(),
+            syncer: Arc::new(RwLock::new(TimeSyncer::new())),
             playback_start: Arc::new(RwLock::new(Instant::now())),
         })
     }
@@ -77,9 +75,7 @@ impl Server {
                     paused,
                     elapsed,
                 } => {
-                    let server_timestamp = self.start_offset + self.start.elapsed();
-                    let latency = server_timestamp - timestamp;
-
+                    let latency = self.syncer.read().await.since(timestamp);
                     *self.playback_start.write().await = Instant::now() - (elapsed + latency);
                 }
                 _ => (),
@@ -92,13 +88,29 @@ impl Server {
         stream.set_reliability_params(true, ReliabilityType::Rexmit, 0);
         println!("accepted sync stream");
 
-        let mut poll_stream = PollStream::new(stream);
-        let packet = Packet::PlaybackUpdate {
-            timestamp: self.start_offset + self.start.elapsed(),
-            elapsed: self.playback_start.read().await.elapsed(),
-        };
-        packet.write_into(&mut poll_stream).await.unwrap();
-        time::sleep(Duration::from_secs(1)).await;
-        Ok(())
+        let mut poll_stream = PollStream::new(Arc::clone(&stream));
+        tokio::spawn(async move {
+            while let Ok(packet) = Packet::read_from(&mut poll_stream).await {
+                match packet {
+                    Packet::TimeSyncRequest => {
+                        Packet::TimeSyncResponse(SystemTime::UNIX_EPOCH.elapsed().unwrap())
+                            .write_into(&mut poll_stream)
+                            .await
+                            .unwrap();
+                    }
+                    _ => (),
+                }
+            }
+        });
+
+        let mut poll_stream = PollStream::new(Arc::clone(&stream));
+        loop {
+            let packet = Packet::PlaybackUpdate {
+                timestamp: self.syncer.read().await.now(),
+                elapsed: self.playback_start.read().await.elapsed(),
+            };
+            packet.write_into(&mut poll_stream).await.unwrap();
+            time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
