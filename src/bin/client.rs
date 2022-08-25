@@ -1,18 +1,21 @@
-use std::{
-    io,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
+use anyhow::{bail, Result};
+use bytes::Bytes;
+use log::{error, info};
+use quinn::{
+    ClientConfig, Connection, ConnectionError, Datagrams, Endpoint, IncomingBiStreams,
+    NewConnection, RecvStream, SendStream,
 };
-use syncplay_rs::{Packet, StreamId, TimeSyncer};
-use tokio::{net::UdpSocket, process::Command, sync::RwLock, time};
-use webrtc_sctp::{
-    association::{Association, Config},
-    chunk::chunk_payload_data::PayloadProtocolIdentifier,
-    stream::{PollStream, ReliabilityType},
+use rkyv::{
+    ser::{serializers::BufferSerializer, Serializer},
+    AlignedBytes, Archived,
 };
+use std::{mem, sync::Arc, time::Duration};
+use syncplay_rs::{Packet, TimeSyncer};
+use tokio::{sync::RwLock, time};
+use tokio_stream::StreamExt;
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<()> {
     // Command::new("mpv")
     //     .arg("--input-ipc-server=/tmp/mpvsocket")
     //     .arg("--idle")
@@ -20,123 +23,189 @@ async fn main() -> io::Result<()> {
     //     .wait()
     //     .await?;
 
-    let client = Arc::new(Client::new().await?);
+    let client_config = {
+        let crypto = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
+
+        ClientConfig::new(Arc::new(crypto))
+    };
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+    endpoint.set_default_client_config(client_config);
+
+    let NewConnection {
+        connection,
+        bi_streams,
+        datagrams,
+        ..
+    } = endpoint
+        .connect("127.0.0.1:8998".parse()?, "localhost")?
+        .await?;
+
+    let state = Arc::new(ClientState::new());
+
+    let fut = handle_bi_streams(Arc::clone(&state), bi_streams);
+    tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            error!("{}", e);
+        }
+    });
+
+    let fut = handle_datagrams(Arc::clone(&state), datagrams, connection.clone());
+    tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            error!("{}", e);
+        }
+    });
+
+    let (mut send, _recv) = connection.open_bi().await?;
+    Packet::Version(69).write_into(&mut send).await?;
+
+    let packet = Packet::PlaybackControl {
+        timestamp: state.syncer.read().await.now(),
+        paused: false,
+        elapsed: Duration::ZERO,
+    };
+    packet.write_into(&mut send).await?;
+
     {
-        let client = Arc::clone(&client);
-        tokio::spawn(async move { client.run_control_stream().await.unwrap() });
-    }
-    {
-        let client = Arc::clone(&client);
-        tokio::spawn(async move { client.run_sync_stream().await.unwrap() });
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
+                let mut serializer = BufferSerializer::new(buf);
+                serializer
+                    .serialize_value(&Packet::TimeSyncRequest)
+                    .unwrap();
+                state.syncer.write().await.start_sync();
+                connection
+                    .send_datagram(Bytes::from(serializer.into_inner()))
+                    .unwrap();
+
+                time::sleep(Duration::from_secs(5)).await;
+            }
+        });
     }
 
     loop {
         time::sleep(Duration::from_secs(1)).await;
-        *client.playback_elapsed.write().await += Duration::from_secs(1);
+        *state.playback_elapsed.write().await += Duration::from_secs(1);
     }
 }
 
-struct Client {
-    association: Association,
+struct ClientState {
     syncer: Arc<RwLock<TimeSyncer>>,
     playback_elapsed: Arc<RwLock<Duration>>,
 }
 
-impl Client {
-    async fn new() -> io::Result<Self> {
-        let conn = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-        conn.connect("127.0.0.1:8998").await?;
-        println!("connected on {}", conn.local_addr().unwrap());
-        let config = Config {
-            net_conn: conn,
-            max_receive_buffer_size: 0,
-            max_message_size: 0,
-            name: "client".to_owned(),
-        };
-        let association = Association::client(config).await?;
-        println!("created client");
-
-        Ok(Self {
-            association,
+impl ClientState {
+    fn new() -> Self {
+        Self {
             syncer: Arc::new(RwLock::new(TimeSyncer::new())),
             playback_elapsed: Arc::new(RwLock::new(Duration::ZERO)),
-        })
+        }
     }
+}
 
-    async fn run_control_stream(&self) -> io::Result<()> {
-        let stream = self
-            .association
-            .open_stream(StreamId::Control.into(), PayloadProtocolIdentifier::Unknown)
-            .await?;
-        stream.set_reliability_params(true, ReliabilityType::Reliable, 0);
-        let mut poll_stream = PollStream::new(Arc::clone(&stream));
-        println!("control stream opened");
-
-        Packet::Version(69).write_into(&mut poll_stream).await?;
-
-        let packet = Packet::PlaybackControl {
-            timestamp: self.syncer.read().await.now(),
-            paused: false,
-            elapsed: Duration::ZERO,
+async fn handle_bi_streams(
+    state: Arc<ClientState>,
+    mut bi_streams: IncomingBiStreams,
+) -> Result<()> {
+    while let Some(stream) = bi_streams.next().await {
+        let (send, recv) = match stream {
+            Err(ConnectionError::ApplicationClosed { .. }) => {
+                info!("connection closed");
+                return Ok(());
+            }
+            Err(e) => {
+                bail!(e);
+            }
+            Ok(s) => s,
         };
-        packet.write_into(&mut poll_stream).await?;
 
-        loop {
-            while let Ok(packet) = Packet::read_from(&mut poll_stream).await {
-                match packet {
-                    Packet::PlaybackControl {
-                        timestamp,
-                        paused,
-                        elapsed,
-                    } => {}
-                    _ => (),
-                }
+        let fut = handle_stream(Arc::clone(&state), send, recv);
+        tokio::spawn(async move {
+            if let Err(e) = fut.await {
+                error!("stream handler failed: {}", e.to_string());
             }
+        });
+
+        let state = Arc::clone(&state);
+    }
+
+    Ok(())
+}
+
+async fn handle_stream(
+    state: Arc<ClientState>,
+    send: SendStream,
+    mut recv: RecvStream,
+) -> Result<()> {
+    while let Ok(packet) = Packet::read_from(&mut recv).await {
+        match packet {
+            Packet::PlaybackControl {
+                timestamp,
+                paused,
+                elapsed,
+            } => {}
+            _ => (),
         }
     }
 
-    async fn run_sync_stream(&self) -> io::Result<()> {
-        let stream = self
-            .association
-            .open_stream(StreamId::Sync.into(), PayloadProtocolIdentifier::Unknown)
-            .await?;
-        stream.set_reliability_params(true, ReliabilityType::Rexmit, 0);
-        let mut poll_stream = PollStream::new(Arc::clone(&stream));
-        println!("sync stream opened");
+    Ok(())
+}
 
-        {
-            let mut poll_stream = PollStream::new(Arc::clone(&stream));
-            let syncer = Arc::clone(&self.syncer);
-            tokio::spawn(async move {
-                loop {
-                    syncer.write().await.start_sync();
-                    Packet::TimeSyncRequest
-                        .write_into(&mut poll_stream)
-                        .await
-                        .unwrap();
-                    time::sleep(Duration::from_secs(5)).await;
-                }
-            });
-        }
+async fn handle_datagrams(
+    state: Arc<ClientState>,
+    mut datagrams: Datagrams,
+    connection: Connection,
+) -> Result<()> {
+    while let Some(Ok(datagram)) = datagrams.next().await {
+        dbg!(&datagram);
+        let mut bytes = AlignedBytes([0u8; mem::size_of::<Archived<Packet>>()]);
+        bytes.copy_from_slice(&datagram);
+        let packet = unsafe { rkyv::from_bytes_unchecked::<Packet>(&bytes[..]).unwrap() };
+        match packet {
+            Packet::PlaybackUpdate { timestamp, elapsed } => {
+                let latency = state.syncer.read().await.since(timestamp);
+                dbg!(latency);
 
-        loop {
-            while let Ok(packet) = Packet::read_from(&mut poll_stream).await {
-                match packet {
-                    Packet::PlaybackUpdate { timestamp, elapsed } => {
-                        let latency = self.syncer.read().await.since(timestamp);
-                        dbg!(latency);
-
-                        let drift_ms: i128 = (elapsed - *self.playback_elapsed.read().await
-                            + latency)
-                            .as_millis() as i128;
-                        dbg!(drift_ms);
-                    }
-                    Packet::TimeSyncResponse(resp_time) => {
-                        self.syncer.write().await.finish_sync(resp_time);
-                    }
-                    _ => (),
-                }
+                let drift_ms = elapsed.as_millis() as i128
+                    - (*state.playback_elapsed.read().await).as_millis() as i128
+                    + latency.as_millis() as i128;
+                dbg!(drift_ms);
             }
+            Packet::TimeSyncResponse(resp_time) => {
+                state.syncer.write().await.finish_sync(resp_time);
+            }
+            _ => (),
         }
+    }
+
+    Ok(())
+}
+
+/// Dummy certificate verifier that treats any certificate as valid.
+/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
     }
 }

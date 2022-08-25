@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-num_enum = "0.5.7"
+anyhow = "1.0.62"
+bytes = "1.2.1"
+env_logger = "0.9.0"
+log = "0.4.17"
+quinn = "0.8.5"
+rcgen = "0.9.3"
 rkyv = { version = "0.7.39", features = ["validation"] }
+rustls = { version = "0.20.6", features = ["dangerous_configuration"] }
 tokio = { version = "1.20.1", features = ["full"] }
-webrtc-sctp = "0.6.0"
-webrtc-util = "0.5.4"
+tokio-stream = "0.1.9"

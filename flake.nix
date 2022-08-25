@@ -9,6 +9,7 @@
       buildInputs = [
         rustc
         cargo
+        clippy
         rust-analyzer
         lldb
         rustfmt
