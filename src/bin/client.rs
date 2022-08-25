@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(ClientState::new());
 
-    let fut = handle_bi_streams(Arc::clone(&state), bi_streams);
+    let fut = handle_incoming_streams(Arc::clone(&state), bi_streams);
     tokio::spawn(async move {
         if let Err(e) = fut.await {
             error!("{}", e);
@@ -108,11 +108,11 @@ impl ClientState {
     }
 }
 
-async fn handle_bi_streams(
+async fn handle_incoming_streams(
     state: Arc<ClientState>,
-    mut bi_streams: IncomingBiStreams,
+    mut streams: IncomingBiStreams,
 ) -> Result<()> {
-    while let Some(stream) = bi_streams.next().await {
+    while let Some(stream) = streams.next().await {
         let (send, recv) = match stream {
             Err(ConnectionError::ApplicationClosed { .. }) => {
                 info!("connection closed");

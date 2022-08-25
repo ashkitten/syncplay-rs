@@ -69,7 +69,7 @@ async fn run_connection(state: Arc<ServerState>, connection: Connecting) -> Resu
         ..
     } = connection.await.unwrap();
 
-    let fut = handle_bi_streams(Arc::clone(&state), bi_streams);
+    let fut = handle_incoming_streams(Arc::clone(&state), bi_streams);
     tokio::spawn(async move {
         if let Err(e) = fut.await {
             error!("{}", e);
@@ -96,11 +96,11 @@ async fn run_connection(state: Arc<ServerState>, connection: Connecting) -> Resu
     }
 }
 
-async fn handle_bi_streams(
+async fn handle_incoming_streams(
     state: Arc<ServerState>,
-    mut bi_streams: IncomingBiStreams,
+    mut streams: IncomingBiStreams,
 ) -> Result<()> {
-    while let Some(stream) = bi_streams.next().await {
+    while let Some(stream) = streams.next().await {
         let (send, recv) = match stream {
             Err(ConnectionError::ApplicationClosed { .. }) => {
                 info!("connection closed");
