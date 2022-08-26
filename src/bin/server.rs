@@ -1,3 +1,4 @@
+use ::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use log::{error, info};
@@ -7,11 +8,7 @@ use quinn::{
 };
 use rkyv::ser::Serializer;
 use rkyv::{ser::serializers::BufferSerializer, AlignedBytes, Archived};
-use std::{
-    mem,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{mem, sync::Arc};
 use syncplay_rs::{Packet, TimeSyncer};
 use tokio::{sync::RwLock, time};
 use tokio_stream::StreamExt;
@@ -92,7 +89,7 @@ async fn run_connection(state: Arc<ServerState>, connection: Connecting) -> Resu
         let mut serializer = BufferSerializer::new(buf);
         serializer.serialize_value(&packet)?;
         connection.send_datagram(Bytes::from(serializer.into_inner()))?;
-        time::sleep(Duration::from_secs(1)).await;
+        time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 

@@ -1,26 +1,33 @@
-use rkyv::{AlignedBytes, Archive, Archived, Deserialize, Serialize};
-use std::{
-    io, mem,
-    time::{Duration, Instant, SystemTime},
+use rkyv::{
+    to_archived,
+    with::{ArchiveWith, DeserializeWith, SerializeWith},
+    AlignedBytes, Archive, Archived, Deserialize, Fallible, Serialize,
 };
+use std::{io, mem, ptr::addr_of_mut};
+use time::{Duration, Instant, OffsetDateTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Serialize, Deserialize, Archive, Debug)]
 pub enum Packet {
     Version(u8),
     TimeSyncRequest,
-    TimeSyncResponse(Duration),
+    TimeSyncResponse(#[with(ArchivedDuration)] Duration),
     MediaInfo {
         name: String,
+        #[with(ArchivedDuration)]
         duration: Duration,
     },
     PlaybackUpdate {
+        #[with(ArchivedDuration)]
         timestamp: Duration,
+        #[with(ArchivedDuration)]
         elapsed: Duration,
     },
     PlaybackControl {
+        #[with(ArchivedDuration)]
         timestamp: Duration,
         paused: bool,
+        #[with(ArchivedDuration)]
         elapsed: Duration,
     },
 }
@@ -54,7 +61,7 @@ pub struct TimeSyncer {
 impl TimeSyncer {
     pub fn new() -> Self {
         Self {
-            epoch: Instant::now() - SystemTime::UNIX_EPOCH.elapsed().unwrap(),
+            epoch: Instant::now() - (OffsetDateTime::now_utc() - OffsetDateTime::UNIX_EPOCH),
             offset: Duration::ZERO,
             sync_start: Instant::now(),
             rtt_samples: Vec::with_capacity(10),
@@ -63,7 +70,7 @@ impl TimeSyncer {
 
     pub fn start_sync(&mut self) {
         self.sync_start = Instant::now();
-        self.epoch = self.sync_start - SystemTime::UNIX_EPOCH.elapsed().unwrap();
+        self.epoch = self.sync_start - (OffsetDateTime::now_utc() - OffsetDateTime::UNIX_EPOCH);
     }
 
     pub fn finish_sync(&mut self, since_epoch: Duration) {
@@ -71,8 +78,7 @@ impl TimeSyncer {
         self.rtt_samples.truncate(10);
         let avg_rtt: Duration =
             self.rtt_samples.iter().sum::<Duration>() / self.rtt_samples.len() as u32;
-        self.offset =
-            since_epoch.saturating_sub(self.sync_start.duration_since(self.epoch)) + avg_rtt / 2;
+        self.offset = since_epoch - (self.sync_start - self.epoch) + avg_rtt / 2;
     }
 
     pub fn since(&self, timestamp: Duration) -> Duration {
@@ -82,5 +88,41 @@ impl TimeSyncer {
 
     pub fn now(&self) -> Duration {
         self.epoch.elapsed() + self.offset
+    }
+}
+
+pub struct ArchivedDuration {
+    seconds: i64,
+    nanoseconds: i32,
+}
+
+impl ArchiveWith<Duration> for ArchivedDuration {
+    type Archived = ArchivedDuration;
+    type Resolver = ();
+
+    #[inline]
+    unsafe fn resolve_with(
+        field: &Duration,
+        _pos: usize,
+        _resolver: Self::Resolver,
+        out: *mut Self::Archived,
+    ) {
+        addr_of_mut!((*out).seconds).write(to_archived!(field.whole_seconds()));
+        addr_of_mut!((*out).nanoseconds).write(to_archived!(field.subsec_nanoseconds()));
+    }
+}
+
+impl<S: Fallible + ?Sized> SerializeWith<Duration, S> for ArchivedDuration {
+    fn serialize_with(_field: &Duration, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        Ok(())
+    }
+}
+
+impl<D: Fallible + ?Sized> DeserializeWith<ArchivedDuration, Duration, D> for ArchivedDuration {
+    fn deserialize_with(
+        field: &ArchivedDuration,
+        _deserializer: &mut D,
+    ) -> Result<Duration, D::Error> {
+        Ok(Duration::new(field.seconds, field.nanoseconds))
     }
 }

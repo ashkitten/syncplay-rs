@@ -1,6 +1,8 @@
+use ::time::Duration;
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use log::{error, info};
+use mpvipc::{Event, Mpv, Property};
 use quinn::{
     ClientConfig, Connection, ConnectionError, Datagrams, Endpoint, IncomingBiStreams,
     NewConnection, RecvStream, SendStream,
@@ -9,19 +11,15 @@ use rkyv::{
     ser::{serializers::BufferSerializer, Serializer},
     AlignedBytes, Archived,
 };
-use std::{mem, sync::Arc, time::Duration};
+use std::process::Command;
+use std::{mem, sync::Arc, thread};
 use syncplay_rs::{Packet, TimeSyncer};
 use tokio::{sync::RwLock, time};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Command::new("mpv")
-    //     .arg("--input-ipc-server=/tmp/mpvsocket")
-    //     .arg("--idle")
-    //     .spawn()?
-    //     .wait()
-    //     .await?;
+    env_logger::init();
 
     let client_config = {
         let crypto = rustls::ClientConfig::builder()
@@ -71,6 +69,7 @@ async fn main() -> Result<()> {
 
     {
         let state = Arc::clone(&state);
+        let connection = connection.clone();
         tokio::spawn(async move {
             loop {
                 let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
@@ -83,15 +82,74 @@ async fn main() -> Result<()> {
                     .send_datagram(Bytes::from(serializer.into_inner()))
                     .unwrap();
 
-                time::sleep(Duration::from_secs(5)).await;
+                time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
     }
 
-    loop {
-        time::sleep(Duration::from_secs(1)).await;
-        *state.playback_elapsed.write().await += Duration::from_secs(1);
+    let mpv_thread = thread::spawn(move || {
+        if let Err(e) = run_mpv(state, connection) {
+            error!("error in mpv thread: {}", e);
+        }
+    });
+
+    #[tokio::main]
+    async fn run_mpv(state: Arc<ClientState>, connection: Connection) -> Result<()> {
+        Command::new("mpv")
+        .arg("--input-ipc-server=/tmp/mpv.sock")
+        .arg("--idle")
+        .arg("--no-terminal")
+        .arg("https://jelly.kity.wtf/Items/9c05b3823ac404f6f05c2e7afbebdf49/Download?api_key=18c4a6f7b0a1401c983af4d8afd53207")
+        .spawn()?;
+
+        let mut mpv = loop {
+            if let Ok(mpv) = Mpv::connect("/tmp/mpv.sock") {
+                break mpv;
+            }
+        };
+
+        mpv.observe_property(1, "playback-time")?;
+
+        while let Ok(event) = mpv.event_listen() {
+            match event {
+                Event::Seek => {
+                    let time = Duration::seconds_f64(mpv.get_property::<f64>("playback-time")?);
+                    *state.playback_elapsed.write().await = time;
+
+                    let (mut send, _) = connection.open_bi().await?;
+                    Packet::PlaybackControl {
+                        timestamp: state.syncer.read().await.now(),
+                        paused: false,
+                        elapsed: time,
+                    }
+                    .write_into(&mut send)
+                    .await?;
+                }
+                Event::PropertyChange { id: _, property } => match property {
+                    Property::PlaybackTime(Some(time)) => {
+                        *state.playback_elapsed.write().await = Duration::seconds_f64(time);
+                    }
+                    property => {
+                        dbg!(property);
+                    }
+                },
+                event => {
+                    dbg!(event);
+                }
+            }
+        }
+
+        Ok(())
     }
+
+    loop {
+        if mpv_thread.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    Ok(())
 }
 
 struct ClientState {
@@ -130,8 +188,6 @@ async fn handle_incoming_streams(
                 error!("stream handler failed: {}", e.to_string());
             }
         });
-
-        let state = Arc::clone(&state);
     }
 
     Ok(())
@@ -162,7 +218,6 @@ async fn handle_datagrams(
     connection: Connection,
 ) -> Result<()> {
     while let Some(Ok(datagram)) = datagrams.next().await {
-        dbg!(&datagram);
         let mut bytes = AlignedBytes([0u8; mem::size_of::<Archived<Packet>>()]);
         bytes.copy_from_slice(&datagram);
         let packet = unsafe { rkyv::from_bytes_unchecked::<Packet>(&bytes[..]).unwrap() };
@@ -171,10 +226,8 @@ async fn handle_datagrams(
                 let latency = state.syncer.read().await.since(timestamp);
                 dbg!(latency);
 
-                let drift_ms = elapsed.as_millis() as i128
-                    - (*state.playback_elapsed.read().await).as_millis() as i128
-                    + latency.as_millis() as i128;
-                dbg!(drift_ms);
+                let drift = elapsed - *state.playback_elapsed.read().await + latency;
+                dbg!(drift);
             }
             Packet::TimeSyncResponse(resp_time) => {
                 state.syncer.write().await.finish_sync(resp_time);
