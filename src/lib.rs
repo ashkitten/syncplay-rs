@@ -7,6 +7,8 @@ use std::{io, mem, ptr::addr_of_mut};
 use time::{Duration, Instant, OffsetDateTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod mpv;
+
 #[derive(Serialize, Deserialize, Archive, Debug)]
 pub enum Packet {
     Version(u8),
@@ -40,7 +42,6 @@ impl Packet {
             return Err(io::Error::new(io::ErrorKind::Other, "stream closed"));
         }
         let packet = unsafe { rkyv::from_bytes_unchecked::<Self>(&buf[..n]).unwrap() };
-        dbg!(&packet);
         Ok(packet)
     }
 
@@ -82,7 +83,6 @@ impl TimeSyncer {
     }
 
     pub fn since(&self, timestamp: Duration) -> Duration {
-        dbg!(self.offset, &self.rtt_samples);
         self.epoch.elapsed() + self.offset - timestamp
     }
 

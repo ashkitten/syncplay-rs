@@ -1,20 +1,26 @@
-use ::time::Duration;
+use ::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use log::{error, info};
-use mpvipc::{Event, Mpv, Property};
 use quinn::{
-    ClientConfig, Connection, ConnectionError, Datagrams, Endpoint, IncomingBiStreams,
-    NewConnection, RecvStream, SendStream,
+    ClientConfig, ConnectionError, Datagrams, Endpoint, IncomingBiStreams, NewConnection,
+    RecvStream, SendStream,
 };
 use rkyv::{
     ser::{serializers::BufferSerializer, Serializer},
     AlignedBytes, Archived,
 };
-use std::process::Command;
-use std::{mem, sync::Arc, thread};
-use syncplay_rs::{Packet, TimeSyncer};
-use tokio::{sync::RwLock, time};
+use std::{mem, sync::Arc};
+use syncplay_rs::mpv::{Command, Event, PropertyChange, SeekOptions};
+use syncplay_rs::{mpv::Mpv, Packet, TimeSyncer};
+use tokio::{
+    select,
+    sync::{
+        mpsc::{self, Sender},
+        RwLock,
+    },
+    time,
+};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -41,7 +47,8 @@ async fn main() -> Result<()> {
         .connect("127.0.0.1:8998".parse()?, "localhost")?
         .await?;
 
-    let state = Arc::new(ClientState::new());
+    let (state, mut rx) = ClientState::new();
+    let state = Arc::new(state);
 
     let fut = handle_incoming_streams(Arc::clone(&state), bi_streams);
     tokio::spawn(async move {
@@ -50,7 +57,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let fut = handle_datagrams(Arc::clone(&state), datagrams, connection.clone());
+    let fut = handle_datagrams(Arc::clone(&state), datagrams);
     tokio::spawn(async move {
         if let Err(e) = fut.await {
             error!("{}", e);
@@ -87,83 +94,99 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mpv_thread = thread::spawn(move || {
-        if let Err(e) = run_mpv(state, connection) {
-            error!("error in mpv thread: {}", e);
+    let mut mpv = loop {
+        if let Ok(mpv) = Mpv::spawn().await {
+            break mpv;
         }
-    });
+    };
 
-    #[tokio::main]
-    async fn run_mpv(state: Arc<ClientState>, connection: Connection) -> Result<()> {
-        Command::new("mpv")
-        .arg("--input-ipc-server=/tmp/mpv.sock")
-        .arg("--idle")
-        .arg("--no-terminal")
-        .arg("https://jelly.kity.wtf/Items/9c05b3823ac404f6f05c2e7afbebdf49/Download?api_key=18c4a6f7b0a1401c983af4d8afd53207")
-        .spawn()?;
+    let mut events = mpv.listen_events();
 
-        let mut mpv = loop {
-            if let Ok(mpv) = Mpv::connect("/tmp/mpv.sock") {
-                break mpv;
-            }
-        };
-
-        mpv.observe_property(1, "playback-time")?;
-
-        while let Ok(event) = mpv.event_listen() {
-            match event {
-                Event::Seek => {
-                    let time = Duration::seconds_f64(mpv.get_property::<f64>("playback-time")?);
-                    *state.playback_elapsed.write().await = time;
-
-                    let (mut send, _) = connection.open_bi().await?;
-                    Packet::PlaybackControl {
-                        timestamp: state.syncer.read().await.now(),
-                        paused: false,
-                        elapsed: time,
-                    }
-                    .write_into(&mut send)
-                    .await?;
-                }
-                Event::PropertyChange { id: _, property } => match property {
-                    Property::PlaybackTime(Some(time)) => {
-                        *state.playback_elapsed.write().await = Duration::seconds_f64(time);
-                    }
-                    property => {
-                        dbg!(property);
-                    }
-                },
-                event => {
-                    dbg!(event);
-                }
-            }
-        }
-
-        Ok(())
-    }
+    mpv.send_command(Command::Observe(1, "playback-time"))
+        .await?;
 
     loop {
-        if mpv_thread.is_finished() {
-            break;
+        println!("select loop");
+        select! {
+            event = events.recv() => {
+                dbg!(&event);
+                match event {
+                    Ok(Event::PlaybackRestart) => {
+                        info!("seeking");
+                        let time = mpv
+                            .send_command(Command::GetProperty("playback-time"))
+                            .await?
+                            .as_f64()
+                            .map(Duration::seconds_f64)
+                            .unwrap();
+                        if let Err(e) = state.tx.send(Message::Seek(time)).await {
+                            error!("error trying to seek to time {}: {}", time, e);
+                        }
+                    }
+                    Ok(Event::PropertyChange { id, property_change }) => {
+                        match property_change {
+                            PropertyChange::PlaybackTime(time) => {
+                                *state.playback_start.write().await =
+                                    Instant::now() - Duration::seconds_f64(time);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("error receiving event: {}", e);
+                    }
+                }
+            },
+            message = rx.recv() => {
+                dbg!(&message);
+                if let Some(message) = message {
+                    match message {
+                        Message::Seek(elapsed) => {
+                            let (mut send, _) = connection.open_bi().await?;
+                            Packet::PlaybackControl {
+                                timestamp: state.syncer.read().await.now(),
+                                paused: false,
+                                elapsed,
+                            }
+                            .write_into(&mut send)
+                            .await?;
+                        }
+                        Message::Sync(elapsed) => {
+                            let cmd = Command::Seek(elapsed.as_seconds_f64(), SeekOptions::Absolute);
+                            if let Err(e) = mpv.send_command(cmd).await {
+                                error!("{}", e);
+                            };
+                        }
+                    }
+                }
+            },
         }
-        tokio::task::yield_now().await;
     }
-
-    Ok(())
 }
 
 struct ClientState {
+    tx: Sender<Message>,
     syncer: Arc<RwLock<TimeSyncer>>,
-    playback_elapsed: Arc<RwLock<Duration>>,
+    playback_start: Arc<RwLock<Instant>>,
 }
 
 impl ClientState {
-    fn new() -> Self {
-        Self {
-            syncer: Arc::new(RwLock::new(TimeSyncer::new())),
-            playback_elapsed: Arc::new(RwLock::new(Duration::ZERO)),
-        }
+    fn new() -> (Self, mpsc::Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(16);
+        (
+            Self {
+                tx,
+                syncer: Arc::new(RwLock::new(TimeSyncer::new())),
+                playback_start: Arc::new(RwLock::new(Instant::now())),
+            },
+            rx,
+        )
     }
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    Seek(Duration),
+    Sync(Duration),
 }
 
 async fn handle_incoming_streams(
@@ -212,11 +235,7 @@ async fn handle_stream(
     Ok(())
 }
 
-async fn handle_datagrams(
-    state: Arc<ClientState>,
-    mut datagrams: Datagrams,
-    connection: Connection,
-) -> Result<()> {
+async fn handle_datagrams(state: Arc<ClientState>, mut datagrams: Datagrams) -> Result<()> {
     while let Some(Ok(datagram)) = datagrams.next().await {
         let mut bytes = AlignedBytes([0u8; mem::size_of::<Archived<Packet>>()]);
         bytes.copy_from_slice(&datagram);
@@ -224,10 +243,20 @@ async fn handle_datagrams(
         match packet {
             Packet::PlaybackUpdate { timestamp, elapsed } => {
                 let latency = state.syncer.read().await.since(timestamp);
-                dbg!(latency);
+                println!("latency: {}", latency.as_seconds_f64());
 
-                let drift = elapsed - *state.playback_elapsed.read().await + latency;
-                dbg!(drift);
+                let client_elapsed =
+                    (Instant::now() - *state.playback_start.read().await) - latency;
+
+                let drift = elapsed - client_elapsed - latency;
+                println!("drift: {}", drift.as_seconds_f64());
+
+                if drift.abs() > Duration::seconds(5) {
+                    state
+                        .tx
+                        .send(Message::Sync(client_elapsed - latency))
+                        .await?;
+                }
             }
             Packet::TimeSyncResponse(resp_time) => {
                 state.syncer.write().await.finish_sync(resp_time);

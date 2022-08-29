@@ -10,6 +10,7 @@ use rkyv::ser::Serializer;
 use rkyv::{ser::serializers::BufferSerializer, AlignedBytes, Archived};
 use std::{mem, sync::Arc};
 use syncplay_rs::{Packet, TimeSyncer};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::{sync::RwLock, time};
 use tokio_stream::StreamExt;
 
@@ -28,7 +29,16 @@ async fn main() -> Result<()> {
     let addr = "0.0.0.0:8998".parse().unwrap();
     let (_endpoint, mut incoming) = Endpoint::server(config, addr)?;
 
-    let state = Arc::new(ServerState::new());
+    let (state, mut rx) = ServerState::new();
+    let state = Arc::new(state);
+
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                Message::Seek(elapsed) => {}
+            }
+        }
+    });
 
     while let Some(connection) = incoming.next().await {
         println!("connection incoming");
@@ -45,17 +55,27 @@ async fn main() -> Result<()> {
 }
 
 struct ServerState {
+    tx: Sender<Message>,
     syncer: Arc<RwLock<TimeSyncer>>,
     playback_start: Arc<RwLock<Instant>>,
 }
 
 impl ServerState {
-    fn new() -> Self {
-        Self {
-            syncer: Arc::new(RwLock::new(TimeSyncer::new())),
-            playback_start: Arc::new(RwLock::new(Instant::now())),
-        }
+    fn new() -> (Self, Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(16);
+        (
+            Self {
+                tx,
+                syncer: Arc::new(RwLock::new(TimeSyncer::new())),
+                playback_start: Arc::new(RwLock::new(Instant::now())),
+            },
+            rx,
+        )
     }
+}
+
+enum Message {
+    Seek(Duration),
 }
 
 async fn run_connection(state: Arc<ServerState>, connection: Connecting) -> Result<()> {
