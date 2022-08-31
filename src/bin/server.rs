@@ -1,18 +1,18 @@
-use ::time::{Duration, Instant};
-use anyhow::{bail, Result};
+#![feature(hash_drain_filter)]
+
+use anyhow::Result;
 use bytes::Bytes;
-use log::{error, info};
-use quinn::{
-    Connecting, Connection, ConnectionError, Datagrams, Endpoint, IncomingBiStreams, RecvStream,
-    SendStream, ServerConfig,
+use log::error;
+use quinn::{Endpoint, ServerConfig, VarInt};
+use rkyv::{
+    ser::{serializers::BufferSerializer, Serializer},
+    Archived,
 };
-use rkyv::ser::Serializer;
-use rkyv::{ser::serializers::BufferSerializer, AlignedBytes, Archived};
-use std::{mem, sync::Arc};
-use syncplay_rs::{Packet, TimeSyncer};
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::{sync::RwLock, time};
-use tokio_stream::StreamExt;
+use std::{collections::HashMap, mem};
+use syncplay_rs::{run_connection, Packet, TimeSyncer};
+use time::Instant;
+use tokio::{select, time::MissedTickBehavior};
+use tokio_stream::{StreamExt, StreamMap};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,161 +29,120 @@ async fn main() -> Result<()> {
     let addr = "0.0.0.0:8998".parse().unwrap();
     let (_endpoint, mut incoming) = Endpoint::server(config, addr)?;
 
-    let (state, mut rx) = ServerState::new();
-    let state = Arc::new(state);
+    let mut packets = StreamMap::new();
+    let mut connections = HashMap::new();
 
-    tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            match message {
-                Message::Seek(elapsed) => {}
-            }
-        }
-    });
-
-    while let Some(connection) = incoming.next().await {
-        println!("connection incoming");
-
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(e) = run_connection(Arc::clone(&state), connection).await {
-                error!("connection failed: {}", e);
-            }
-        });
-    }
-
-    Ok(())
-}
-
-struct ServerState {
-    tx: Sender<Message>,
-    syncer: Arc<RwLock<TimeSyncer>>,
-    playback_start: Arc<RwLock<Instant>>,
-}
-
-impl ServerState {
-    fn new() -> (Self, Receiver<Message>) {
-        let (tx, rx) = mpsc::channel(16);
-        (
-            Self {
-                tx,
-                syncer: Arc::new(RwLock::new(TimeSyncer::new())),
-                playback_start: Arc::new(RwLock::new(Instant::now())),
-            },
-            rx,
-        )
-    }
-}
-
-enum Message {
-    Seek(Duration),
-}
-
-async fn run_connection(state: Arc<ServerState>, connection: Connecting) -> Result<()> {
-    let quinn::NewConnection {
-        connection,
-        bi_streams,
-        datagrams,
-        ..
-    } = connection.await.unwrap();
-
-    let fut = handle_incoming_streams(Arc::clone(&state), bi_streams);
-    tokio::spawn(async move {
-        if let Err(e) = fut.await {
-            error!("{}", e);
-        }
-    });
-
-    let fut = handle_datagrams(Arc::clone(&state), datagrams, connection.clone());
-    tokio::spawn(async move {
-        if let Err(e) = fut.await {
-            error!("{}", e);
-        }
-    });
+    let syncer = TimeSyncer::new();
+    let mut playback_start = Instant::now();
+    let mut pause_state = None;
+    let mut sync_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        let packet = Packet::PlaybackUpdate {
-            timestamp: state.syncer.read().await.now(),
-            elapsed: state.playback_start.read().await.elapsed(),
-        };
-        let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
-        let mut serializer = BufferSerializer::new(buf);
-        serializer.serialize_value(&packet)?;
-        connection.send_datagram(Bytes::from(serializer.into_inner()))?;
-        time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-
-async fn handle_incoming_streams(
-    state: Arc<ServerState>,
-    mut streams: IncomingBiStreams,
-) -> Result<()> {
-    while let Some(stream) = streams.next().await {
-        let (send, recv) = match stream {
-            Err(ConnectionError::ApplicationClosed { .. }) => {
-                info!("connection closed");
-                return Ok(());
+        select! {
+            Some(connection) = incoming.next() => {
+                let (stream, connection) = run_connection(connection.await?).await;
+                packets.insert(connection.stable_id(), stream);
+                connections.insert(connection.stable_id(), connection);
             }
-            Err(e) => {
-                bail!(e);
+
+            Some((id, packet)) = packets.next() => {
+                dbg!(&packet);
+                match packet {
+                    Packet::Version(version) => {
+                        // TODO: actual versions lol
+                        if version != 69 {
+                            connections[&id].close(VarInt::from_u32(69), "wrong version".as_bytes())
+                        }
+
+                        let packet = Packet::PlaybackStart {
+                            timestamp: syncer.now(),
+                            paused: pause_state.is_some(),
+                            elapsed: if let Some(elapsed) = pause_state {
+                                elapsed
+                            } else {
+                                playback_start.elapsed()
+                            },
+                        };
+                        let mut stream = connections[&id].open_uni().await?;
+                        packet.write_into(&mut stream).await?;
+                    }
+
+                    Packet::PlaybackControl {
+                        timestamp,
+                        paused,
+                        elapsed,
+                    } => {
+                        let latency = syncer.since(timestamp);
+                        playback_start = Instant::now() - (elapsed + latency);
+                        pause_state = if paused { Some(elapsed) } else { None };
+
+                        let packet = Packet::PlaybackControl {
+                            timestamp: syncer.now(),
+                            paused: pause_state.is_some(),
+                            elapsed: if let Some(elapsed) = pause_state {
+                                elapsed
+                            } else {
+                                playback_start.elapsed()
+                            },
+                        };
+
+                        let mut to_remove = Vec::new();
+                        for (connection_id, connection) in connections.iter() {
+                            if id != *connection_id {
+                                match connection.open_uni().await {
+                                    Ok(mut stream) => {
+                                        if let Err(e) = packet.write_into(&mut stream).await {
+                                            error!("error writing to stream: {}", e);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("error opening stream: {}", e);
+                                        to_remove.push(*connection_id);
+                                    }
+                                }
+                            }
+                        }
+                        for id in to_remove {
+                            connections.remove(&id);
+                        }
+                    }
+
+                    Packet::TimeSyncRequest => {
+                        let packet = Packet::TimeSyncResponse(syncer.now());
+                        let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
+                        let mut serializer = BufferSerializer::new(buf);
+                        serializer.serialize_value(&packet)?;
+                        connections[&id].send_datagram(Bytes::from(serializer.into_inner()))?;
+                    }
+
+                    _ => {
+                        dbg!(packet);
+                    }
+                }
             }
-            Ok(s) => s,
-        };
 
-        let fut = handle_stream(Arc::clone(&state), send, recv);
-        tokio::spawn(async move {
-            if let Err(e) = fut.await {
-                error!("stream handler failed: {}", e.to_string());
-            }
-        });
-
-        let state = Arc::clone(&state);
-    }
-
-    Ok(())
-}
-
-async fn handle_stream(
-    state: Arc<ServerState>,
-    send: SendStream,
-    mut recv: RecvStream,
-) -> Result<()> {
-    while let Ok(packet) = Packet::read_from(&mut recv).await {
-        match packet {
-            Packet::PlaybackControl {
-                timestamp,
-                paused,
-                elapsed,
-            } => {
-                let latency = state.syncer.read().await.since(timestamp);
-                *state.playback_start.write().await = Instant::now() - (elapsed + latency);
-            }
-            _ => (),
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_datagrams(
-    state: Arc<ServerState>,
-    mut datagrams: Datagrams,
-    connection: Connection,
-) -> Result<()> {
-    while let Some(Ok(datagram)) = datagrams.next().await {
-        let mut bytes = AlignedBytes([0u8; mem::size_of::<Archived<Packet>>()]);
-        bytes.copy_from_slice(&datagram);
-        let packet = unsafe { rkyv::from_bytes_unchecked::<Packet>(&bytes[..]).unwrap() };
-        match packet {
-            Packet::TimeSyncRequest => {
-                let packet = Packet::TimeSyncResponse(state.syncer.read().await.now());
+            _ = sync_interval.tick(), if pause_state.is_none() => {
+                let packet = Packet::PlaybackUpdate {
+                    timestamp: syncer.now(),
+                    elapsed: playback_start.elapsed(),
+                };
                 let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
                 let mut serializer = BufferSerializer::new(buf);
                 serializer.serialize_value(&packet)?;
-                connection.send_datagram(Bytes::from(serializer.into_inner()))?;
+                let bytes = Bytes::from(serializer.into_inner());
+
+                let mut to_remove = Vec::new();
+                for (connection_id, connection) in connections.iter() {
+                    if let Err(e) = connection.send_datagram(bytes.clone()) {
+                        error!("error sending datagram: {}", e);
+                        to_remove.push(*connection_id);
+                    }
+                }
+                for id in to_remove {
+                    connections.remove(&id);
+                }
             }
-            _ => (),
         }
     }
-
-    Ok(())
 }

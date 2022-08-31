@@ -1,3 +1,7 @@
+use anyhow::Error;
+use async_stream::stream;
+use futures::{Stream, StreamExt};
+use quinn::{Connection, NewConnection};
 use rkyv::{
     to_archived,
     with::{ArchiveWith, DeserializeWith, SerializeWith},
@@ -5,7 +9,12 @@ use rkyv::{
 };
 use std::{io, mem, ptr::addr_of_mut};
 use time::{Duration, Instant, OffsetDateTime};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    select,
+};
+use tokio_stream::StreamMap;
+use tokio_util::codec::{Decoder, FramedRead};
 
 pub mod mpv;
 
@@ -32,6 +41,13 @@ pub enum Packet {
         #[with(ArchivedDuration)]
         elapsed: Duration,
     },
+    PlaybackStart {
+        #[with(ArchivedDuration)]
+        timestamp: Duration,
+        paused: bool,
+        #[with(ArchivedDuration)]
+        elapsed: Duration,
+    },
 }
 
 impl Packet {
@@ -49,6 +65,26 @@ impl Packet {
         let buf = rkyv::to_bytes::<_, { mem::size_of::<Archived<Packet>>() }>(self).unwrap();
         writer.write_all(&buf).await?;
         Ok(())
+    }
+}
+
+pub struct PacketDecoder;
+
+impl Decoder for PacketDecoder {
+    type Error = Error;
+    type Item = Packet;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < mem::size_of::<Archived<Packet>>() {
+            return Ok(None);
+        }
+
+        let src = src.split_to(mem::size_of::<Archived<Packet>>());
+        let mut bytes = AlignedBytes([0u8; mem::size_of::<Archived<Packet>>()]);
+        bytes.copy_from_slice(&src);
+        Ok(Some(unsafe {
+            rkyv::from_bytes_unchecked::<Packet>(&bytes[..]).unwrap()
+        }))
     }
 }
 
@@ -125,4 +161,41 @@ impl<D: Fallible + ?Sized> DeserializeWith<ArchivedDuration, Duration, D> for Ar
     ) -> Result<Duration, D::Error> {
         Ok(Duration::new(field.seconds, field.nanoseconds))
     }
+}
+
+// TODO: when StreamMap gets a `.get()` method, create SyncplayConnection
+// wrapper that provides a Stream and Sink of Packets and use that instead
+pub async fn run_connection(
+    connection: NewConnection,
+) -> (impl Stream<Item = Packet> + Unpin, Connection) {
+    let NewConnection {
+        connection,
+        mut uni_streams,
+        mut datagrams,
+        ..
+    } = connection;
+
+    let stream = Box::pin(stream! {
+        let mut streams = StreamMap::new();
+
+        loop {
+            select! {
+                Some(Ok(recv)) = uni_streams.next() => {
+                    streams.insert(recv.id(), FramedRead::new(recv, PacketDecoder));
+                }
+                Some((_, Ok(packet))) = streams.next() => {
+                    yield packet;
+                }
+                Some(Ok(datagram)) = datagrams.next() => {
+                    let mut bytes = AlignedBytes([0u8; mem::size_of::<Archived<Packet>>()]);
+                    bytes.copy_from_slice(&datagram);
+                    let packet = unsafe { rkyv::from_bytes_unchecked::<Packet>(&bytes[..]).unwrap() };
+                    yield packet;
+                }
+                else => break,
+            }
+        }
+    });
+
+    (stream, connection)
 }

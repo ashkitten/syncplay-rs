@@ -7,12 +7,13 @@
     devShells."x86_64-linux".default = with nixpkgs.legacyPackages."x86_64-linux"; mkShell {
       name = "dev-env";
       buildInputs = [
-        rustc
-        cargo
-        clippy
+        rustup # need nightly for now
+        # rustc
+        # cargo
+        # clippy
+        # rustfmt
         rust-analyzer
         lldb
-        rustfmt
       ];
     };
   };

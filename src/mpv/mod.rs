@@ -1,32 +1,19 @@
-use futures::stream::SplitSink;
-use futures::SinkExt;
-use futures::StreamExt;
-use log::error;
-use log::info;
-use log::trace;
-use serde::de;
-use serde::de::MapAccess;
-use serde::de::Visitor;
-use serde::ser::SerializeMap;
-use serde::Deserialize;
-use serde::Deserializer;
-use serde::Serialize;
-use serde_json::json;
-use serde_json::Value;
-use std::collections::BTreeMap;
-use std::fmt;
-use std::io;
-use std::process;
+use futures::{stream::SplitSink, SinkExt, StreamExt};
+use log::{error, info, trace};
+use serde::{
+    de,
+    de::{MapAccess, Visitor},
+    ser::SerializeMap,
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::{json, Value};
+use std::{collections::BTreeMap, fmt, io, process};
 use thiserror::Error;
-use tokio::net::UnixStream;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tokio_util::codec::Decoder;
-use tokio_util::codec::Encoder;
-use tokio_util::codec::Framed;
-use tokio_util::codec::LinesCodec;
-use tokio_util::codec::LinesCodecError;
+use tokio::{
+    net::UnixStream,
+    sync::{broadcast, mpsc, oneshot},
+};
+use tokio_util::codec::{Decoder, Encoder, Framed, LinesCodec, LinesCodecError};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -161,8 +148,8 @@ impl MpvCodec {
 }
 
 impl Decoder for MpvCodec {
-    type Item = Message;
     type Error = CodecError;
+    type Item = Message;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if let Some(line) = self.0.decode(src)? {
@@ -270,6 +257,7 @@ pub enum Event {
         #[serde(flatten)]
         property_change: PropertyChange,
     },
+    Pause,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -290,6 +278,7 @@ pub enum Command {
     Seek(f64, SeekOptions),
     Observe(i64, &'static str),
     GetProperty(&'static str),
+    SetProperty(&'static str, Value),
 }
 
 impl Serialize for Command {
@@ -306,6 +295,9 @@ impl Serialize for Command {
             }
             Command::GetProperty(property) => {
                 json!(["get_property", property])
+            }
+            Command::SetProperty(property, value) => {
+                json!(["set_property", property, value])
             }
         };
 
