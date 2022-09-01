@@ -63,7 +63,6 @@ impl Mpv {
             .arg("--idle")
             .arg("--force-window")
             .arg("--no-terminal")
-            .arg("https://youtu.be/tNZWGLT59wA")
             .spawn()?;
 
         let (tx, mut rx) = loop {
@@ -283,6 +282,7 @@ pub enum Command {
     Observe(i64, &'static str),
     GetProperty(&'static str),
     SetProperty(&'static str, Value),
+    LoadFile(String, LoadFileOptions),
 }
 
 impl Serialize for Command {
@@ -303,6 +303,9 @@ impl Serialize for Command {
             Command::SetProperty(property, value) => {
                 json!(["set_property", property, value])
             }
+            Command::LoadFile(filename, options) => {
+                json!(["loadfile", filename, options])
+            }
         };
 
         let mut map = serializer.serialize_map(Some(1))?;
@@ -318,4 +321,12 @@ pub enum SeekOptions {
     Absolute,
     RelativePercent,
     AbsolutePercent,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoadFileOptions {
+    Replace,
+    Append,
+    AppendPlay,
 }

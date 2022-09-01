@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use clap::Parser;
 use log::{error, info};
 use quinn::{ClientConfig, Connection, Endpoint};
 use rkyv::{
@@ -9,16 +10,24 @@ use rkyv::{
 use serde_json::Value;
 use std::{mem, sync::Arc};
 use syncplay_rs::{
-    mpv::{Command, Mpv, SeekOptions},
+    mpv::{Command, LoadFileOptions, Mpv, SeekOptions},
     run_connection, Packet, PlaybackState, TimeSyncer,
 };
 use time::{Duration, Instant};
 use tokio::{select, time::MissedTickBehavior};
 use tokio_stream::StreamExt;
 
+#[derive(Parser)]
+struct Args {
+    server: String,
+    filename: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+
+    let args = Args::parse();
 
     let client_config = {
         let crypto = rustls::ClientConfig::builder()
@@ -32,9 +41,7 @@ async fn main() -> Result<()> {
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
     endpoint.set_default_client_config(client_config);
 
-    let connection = endpoint
-        .connect("127.0.0.1:8998".parse()?, "localhost")?
-        .await?;
+    let connection = endpoint.connect(args.server.parse()?, "localhost")?.await?;
     let (mut stream, connection) = run_connection(connection).await;
 
     let mut syncer = TimeSyncer::new();
@@ -53,6 +60,9 @@ async fn main() -> Result<()> {
     let mut events = mpv.listen_events();
 
     mpv.send_command(Command::Observe(2, "pause")).await?;
+
+    mpv.send_command(Command::LoadFile(args.filename, LoadFileOptions::Replace))
+        .await?;
 
     async fn get_playback_state(mpv: &mut Mpv) -> PlaybackState {
         if let Ok(Value::Number(time)) = mpv
