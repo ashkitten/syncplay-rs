@@ -61,14 +61,8 @@ async fn main() -> Result<()> {
 
     mpv.send_command(Command::Observe(2, "pause")).await?;
 
-    while mpv
-        .send_command(Command::LoadFile(
-            args.filename.clone(),
-            LoadFileOptions::Replace,
-        ))
-        .await
-        .is_err()
-    {}
+    mpv.send_command(Command::LoadFile(args.filename, LoadFileOptions::Replace))
+        .await?;
 
     async fn get_playback_state(mpv: &mut Mpv) -> PlaybackState {
         if let Ok(Value::Number(time)) = mpv
