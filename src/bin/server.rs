@@ -1,5 +1,3 @@
-#![feature(hash_drain_filter)]
-
 use anyhow::Result;
 use bytes::Bytes;
 use log::error;
