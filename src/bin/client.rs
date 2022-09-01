@@ -128,8 +128,7 @@ async fn main() -> Result<()> {
                     elapsed: *elapsed,
                 },
             };
-            let mut stream = connection.open_uni().await?;
-            packet.write_into(&mut stream).await?;
+            packet.write_into(&mut send).await?;
         }
 
         Ok(())
