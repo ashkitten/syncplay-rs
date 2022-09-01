@@ -260,6 +260,19 @@ pub enum Event {
     },
     Pause,
     Unpause,
+    Seek,
+    FileLoaded,
+    StartFile {
+        playlist_entry_id: u64,
+    },
+    EndFile {
+        reason: String,
+        playlist_entry_id: u64,
+    },
+    TracksChanged,
+    VideoReconfig,
+    AudioReconfig,
+    MetadataUpdate,
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
             PlaybackState::Playing { start } => match new_state {
                 PlaybackState::Stopped => true,
                 PlaybackState::Playing { start: new_start } => {
-                    (*start - *new_start).abs() > Duration::seconds(1)
+                    (*start - *new_start).abs() > Duration::seconds(2)
                 }
                 PlaybackState::Paused { .. } => true,
             },
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
                 PlaybackState::Playing { .. } => true,
                 PlaybackState::Paused {
                     elapsed: new_elapsed,
-                } => (*elapsed - *new_elapsed).abs() > Duration::seconds(1),
+                } => (*elapsed - *new_elapsed).abs() > Duration::seconds(2),
             },
         };
 
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                             PlaybackState::Playing { start } => {
-                                if (start.elapsed() - time).abs() < Duration::seconds(1) {
+                                if (start.elapsed() - time).abs() < Duration::seconds(2) {
                                     if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
                                         error!("error seeking: {}", e);
                                     }

@@ -42,7 +42,8 @@ async fn main() -> Result<()> {
             Some(connection) = incoming.next() => {
                 let (stream, connection) = run_connection(connection.await?).await;
                 packets.insert(connection.stable_id(), stream);
-                connections.insert(connection.stable_id(), connection);
+                let send = connection.open_uni().await?;
+                connections.insert(connection.stable_id(), (connection, send));
             }
 
             Some((id, packet)) = packets.next() => {
@@ -51,7 +52,7 @@ async fn main() -> Result<()> {
                     Packet::Version(version) => {
                         // TODO: actual versions lol
                         if version != 69 {
-                            connections[&id].close(VarInt::from_u32(69), "wrong version".as_bytes())
+                            connections[&id].0.close(VarInt::from_u32(69), "wrong version".as_bytes())
                         }
 
                         let packet = match playback_state {
@@ -67,8 +68,7 @@ async fn main() -> Result<()> {
                                 elapsed: elapsed,
                             },
                         };
-                        let mut stream = connections[&id].open_uni().await?;
-                        packet.write_into(&mut stream).await?;
+                        packet.write_into(&mut connections.get_mut(&id).unwrap().1).await?;
                     }
 
                     Packet::PlaybackControl {
@@ -102,18 +102,11 @@ async fn main() -> Result<()> {
                         };
 
                         let mut to_remove = Vec::new();
-                        for (connection_id, connection) in connections.iter() {
+                        for (connection_id, (_, send)) in connections.iter_mut() {
                             if id != *connection_id {
-                                match connection.open_uni().await {
-                                    Ok(mut stream) => {
-                                        if let Err(e) = packet.write_into(&mut stream).await {
-                                            error!("error writing to stream: {}", e);
-                                        }
-                                    },
-                                    Err(e) => {
-                                        error!("error opening stream: {}", e);
-                                        to_remove.push(*connection_id);
-                                    }
+                                if let Err(e) = packet.write_into(send).await {
+                                    error!("error writing to stream: {}", e);
+                                    to_remove.push(*connection_id);
                                 }
                             }
                         }
@@ -127,7 +120,7 @@ async fn main() -> Result<()> {
                         let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
                         let mut serializer = BufferSerializer::new(buf);
                         serializer.serialize_value(&packet)?;
-                        connections[&id].send_datagram(Bytes::from(serializer.into_inner()))?;
+                        connections[&id].0.send_datagram(Bytes::from(serializer.into_inner()))?;
                     }
 
                     _ => {
@@ -148,7 +141,7 @@ async fn main() -> Result<()> {
                     let bytes = Bytes::from(serializer.into_inner());
 
                     let mut to_remove = Vec::new();
-                    for (connection_id, connection) in connections.iter() {
+                    for (connection_id, (connection, _)) in connections.iter() {
                         if let Err(e) = connection.send_datagram(bytes.clone()) {
                             error!("error sending datagram: {}", e);
                             to_remove.push(*connection_id);
