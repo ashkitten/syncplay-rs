@@ -1,7 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use log::{error, info};
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint};
 use rkyv::{
     ser::{serializers::BufferSerializer, Serializer},
     Archived,
@@ -9,8 +9,8 @@ use rkyv::{
 use serde_json::Value;
 use std::{mem, sync::Arc};
 use syncplay_rs::{
-    mpv::{Command, Event, Mpv, PropertyChange, SeekOptions},
-    run_connection, Packet, TimeSyncer,
+    mpv::{Command, Mpv, SeekOptions},
+    run_connection, Packet, PlaybackState, TimeSyncer,
 };
 use time::{Duration, Instant};
 use tokio::{select, time::MissedTickBehavior};
@@ -38,8 +38,6 @@ async fn main() -> Result<()> {
     let (mut stream, connection) = run_connection(connection).await;
 
     let mut syncer = TimeSyncer::new();
-
-    let mut playback_start = Instant::now();
     let mut sync_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
     sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -54,58 +52,133 @@ async fn main() -> Result<()> {
 
     let mut events = mpv.listen_events();
 
-    mpv.send_command(Command::Observe(1, "playback-time"))
-        .await?;
+    mpv.send_command(Command::Observe(2, "pause")).await?;
+
+    async fn get_playback_state(mpv: &mut Mpv) -> PlaybackState {
+        if let Ok(Value::Number(time)) = mpv
+            .send_command(Command::GetProperty("playback-time"))
+            .await
+        {
+            let time = Duration::seconds_f64(time.as_f64().unwrap());
+            if let Ok(Value::Bool(paused)) = mpv.send_command(Command::GetProperty("pause")).await {
+                if paused {
+                    return PlaybackState::Paused { elapsed: time };
+                } else {
+                    return PlaybackState::Playing {
+                        start: Instant::now() - time,
+                    };
+                }
+            }
+        }
+
+        PlaybackState::Stopped
+    }
+
+    async fn transition_state(
+        connection: &Connection,
+        syncer: &TimeSyncer,
+        state: &PlaybackState,
+        new_state: &PlaybackState,
+    ) -> Result<()> {
+        let send_packet = match state {
+            PlaybackState::Stopped => match new_state {
+                PlaybackState::Stopped => false,
+                PlaybackState::Playing { .. } => true,
+                PlaybackState::Paused { .. } => true,
+            },
+
+            PlaybackState::Playing { start } => match new_state {
+                PlaybackState::Stopped => true,
+                PlaybackState::Playing { start: new_start } => {
+                    (*start - *new_start).abs() > Duration::seconds(1)
+                }
+                PlaybackState::Paused { .. } => true,
+            },
+
+            PlaybackState::Paused { elapsed } => match new_state {
+                PlaybackState::Stopped => true,
+                PlaybackState::Playing { .. } => true,
+                PlaybackState::Paused {
+                    elapsed: new_elapsed,
+                } => (*elapsed - *new_elapsed).abs() > Duration::seconds(1),
+            },
+        };
+
+        if send_packet {
+            let packet = match new_state {
+                PlaybackState::Stopped => unimplemented!(),
+                PlaybackState::Playing { start } => Packet::PlaybackControl {
+                    timestamp: syncer.now(),
+                    paused: false,
+                    elapsed: start.elapsed(),
+                },
+                PlaybackState::Paused { elapsed } => Packet::PlaybackControl {
+                    timestamp: syncer.now(),
+                    paused: true,
+                    elapsed: *elapsed,
+                },
+            };
+            let mut stream = connection.open_uni().await?;
+            packet.write_into(&mut stream).await?;
+        }
+
+        Ok(())
+    }
+
+    let mut playback_state = get_playback_state(&mut mpv).await;
 
     loop {
         select! {
             Some(packet) = stream.next() => {
+                playback_state = get_playback_state(&mut mpv).await;
+
                 match packet {
-                    Packet::PlaybackStart { timestamp, paused, elapsed } => {
-                        let latency = syncer.since(timestamp);
-                        let time = elapsed - latency;
-
-                        while let Err(e) = mpv.send_command(Command::SetProperty("pause", Value::Bool(paused))).await {
-                            error!("error setting pause state: {}", e);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        }
-
-                        while let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
-                            error!("error seeking: {}", e);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        }
-                    }
-
                     Packet::PlaybackControl { timestamp, paused, elapsed } => {
                         info!("PlaybackControl {{ paused: {paused}, elapsed: {elapsed} }}");
                         let latency = syncer.since(timestamp);
                         let time = elapsed - latency;
 
+                        match playback_state {
+                            PlaybackState::Stopped => {
+                                while let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                    error!("error seeking: {}", e);
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                            PlaybackState::Playing { start } => {
+                                if (start.elapsed() - time).abs() < Duration::seconds(1) {
+                                    if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                        error!("error seeking: {}", e);
+                                    }
+                                }
+                            }
+                            PlaybackState::Paused { .. } => {
+                                if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                    error!("error seeking: {}", e);
+                                }
+                            }
+                        }
+
                         while let Err(e) = mpv.send_command(Command::SetProperty("pause", Value::Bool(paused))).await {
                             error!("error setting pause state: {}", e);
                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                         }
-
-                        if (time - playback_start.elapsed()).abs() > Duration::seconds(1) {
-                            while let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
-                                error!("error seeking: {}", e);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            }
-                        }
                     }
 
                     Packet::PlaybackUpdate { timestamp, elapsed } => {
-                        let latency = syncer.since(timestamp);
-                        println!("latency: {}", latency.as_seconds_f64());
-                        let client_elapsed = playback_start.elapsed() - latency;
-                        let drift = elapsed - client_elapsed - latency;
-                        println!("drift: {}", drift.as_seconds_f64());
-                        let time = elapsed - latency;
+                        if let PlaybackState::Playing { start } = playback_state {
+                            let latency = syncer.since(timestamp);
+                            println!("latency: {}", latency.as_seconds_f64());
+                            let client_elapsed = start.elapsed() - latency;
+                            let drift = elapsed - client_elapsed - latency;
+                            println!("drift: {}", drift.as_seconds_f64());
+                            let time = elapsed - latency;
 
-                        // TODO: slow down/speed up to resync smaller intervals
-                        if drift.abs() > Duration::seconds(5) {
-                            if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
-                                error!("error seeking: {}", e);
+                            // TODO: slow down/speed up to resync smaller intervals
+                            if drift.abs() > Duration::seconds(2) {
+                                if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                    error!("error seeking: {}", e);
+                                }
                             }
                         }
                     }
@@ -121,53 +194,10 @@ async fn main() -> Result<()> {
             }
 
             event = events.recv() => {
-                match event {
-                    Ok(Event::PlaybackRestart) => {
-                        let time = loop {
-                            if let Ok(time) = mpv.send_command(Command::GetProperty("playback-time")).await {
-                                break time.as_f64().map(Duration::seconds_f64).unwrap();
-                            }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        };
-
-                        let packet = Packet::PlaybackControl {
-                            timestamp: syncer.now(),
-                            paused: false,
-                            elapsed: time,
-                        };
-                        let mut stream = connection.open_uni().await?;
-                        packet.write_into(&mut stream).await?;
-                    }
-
-                    Ok(Event::PropertyChange { id: _, property_change }) => {
-                        match property_change {
-                            PropertyChange::PlaybackTime(time) => {
-                                playback_start = Instant::now() - Duration::seconds_f64(time);
-                            }
-                        }
-                    }
-
-                    Ok(Event::Pause) => {
-                        let time = loop {
-                            if let Ok(time) = mpv.send_command(Command::GetProperty("playback-time")).await {
-                                break time.as_f64().map(Duration::seconds_f64).unwrap();
-                            }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        };
-
-                        let packet = Packet::PlaybackControl {
-                            timestamp: syncer.now(),
-                            paused: true,
-                            elapsed: time,
-                        };
-                        let mut stream = connection.open_uni().await?;
-                        packet.write_into(&mut stream).await?;
-                    }
-
-                    Err(e) => {
-                        bail!("error receiving event: {}", e);
-                    }
-                }
+                dbg!(&event);
+                let new_state = get_playback_state(&mut mpv).await;
+                transition_state(&connection, &syncer, &playback_state, &new_state).await?;
+                playback_state = new_state;
             },
 
             _ = sync_interval.tick() => {

@@ -61,7 +61,9 @@ impl Mpv {
         tokio::process::Command::new("mpv")
             .arg(format!("--input-ipc-server={}", sock))
             .arg("--idle")
+            .arg("--force-window")
             .arg("--no-terminal")
+            .arg("https://youtu.be/tNZWGLT59wA")
             .spawn()?;
 
         let (tx, mut rx) = loop {
@@ -258,12 +260,14 @@ pub enum Event {
         property_change: PropertyChange,
     },
     Pause,
+    Unpause,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "name", content = "data", rename_all = "kebab-case")]
 pub enum PropertyChange {
     PlaybackTime(f64),
+    Pause(bool),
 }
 
 #[derive(Serialize, Debug, Clone)]

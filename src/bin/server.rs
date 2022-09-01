@@ -9,7 +9,7 @@ use rkyv::{
     Archived,
 };
 use std::{collections::HashMap, mem};
-use syncplay_rs::{run_connection, Packet, TimeSyncer};
+use syncplay_rs::{run_connection, Packet, PlaybackState, TimeSyncer};
 use time::Instant;
 use tokio::{select, time::MissedTickBehavior};
 use tokio_stream::{StreamExt, StreamMap};
@@ -33,8 +33,9 @@ async fn main() -> Result<()> {
     let mut connections = HashMap::new();
 
     let syncer = TimeSyncer::new();
-    let mut playback_start = Instant::now();
-    let mut pause_state = None;
+
+    let mut playback_state = PlaybackState::Stopped;
+
     let mut sync_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -55,13 +56,17 @@ async fn main() -> Result<()> {
                             connections[&id].close(VarInt::from_u32(69), "wrong version".as_bytes())
                         }
 
-                        let packet = Packet::PlaybackStart {
-                            timestamp: syncer.now(),
-                            paused: pause_state.is_some(),
-                            elapsed: if let Some(elapsed) = pause_state {
-                                elapsed
-                            } else {
-                                playback_start.elapsed()
+                        let packet = match playback_state {
+                            PlaybackState::Stopped => continue,
+                            PlaybackState::Playing { start } => Packet::PlaybackControl {
+                                timestamp: syncer.now(),
+                                paused: false,
+                                elapsed: start.elapsed(),
+                            },
+                            PlaybackState::Paused { elapsed } => Packet::PlaybackControl {
+                                timestamp: syncer.now(),
+                                paused: true,
+                                elapsed: elapsed,
                             },
                         };
                         let mut stream = connections[&id].open_uni().await?;
@@ -74,16 +79,27 @@ async fn main() -> Result<()> {
                         elapsed,
                     } => {
                         let latency = syncer.since(timestamp);
-                        playback_start = Instant::now() - (elapsed + latency);
-                        pause_state = if paused { Some(elapsed) } else { None };
 
-                        let packet = Packet::PlaybackControl {
-                            timestamp: syncer.now(),
-                            paused: pause_state.is_some(),
-                            elapsed: if let Some(elapsed) = pause_state {
-                                elapsed
-                            } else {
-                                playback_start.elapsed()
+                        playback_state = match paused {
+                            false => PlaybackState::Playing {
+                                start: Instant::now() - (elapsed + latency),
+                            },
+                            true => PlaybackState::Paused {
+                                elapsed: elapsed + latency,
+                            },
+                        };
+
+                        let packet = match playback_state {
+                            PlaybackState::Stopped => continue,
+                            PlaybackState::Playing { start } => Packet::PlaybackControl {
+                                timestamp: syncer.now(),
+                                paused: false,
+                                elapsed: start.elapsed(),
+                            },
+                            PlaybackState::Paused { elapsed } => Packet::PlaybackControl {
+                                timestamp: syncer.now(),
+                                paused: true,
+                                elapsed: elapsed,
                             },
                         };
 
@@ -122,27 +138,34 @@ async fn main() -> Result<()> {
                 }
             }
 
-            _ = sync_interval.tick(), if pause_state.is_none() => {
-                let packet = Packet::PlaybackUpdate {
-                    timestamp: syncer.now(),
-                    elapsed: playback_start.elapsed(),
-                };
-                let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
-                let mut serializer = BufferSerializer::new(buf);
-                serializer.serialize_value(&packet)?;
-                let bytes = Bytes::from(serializer.into_inner());
+            _ = sync_interval.tick() => {
+                if let PlaybackState::Playing { start } = playback_state {
+                    let packet = Packet::PlaybackUpdate {
+                        timestamp: syncer.now(),
+                        elapsed: start.elapsed(),
+                    };
+                    let buf = Box::from([0u8; { mem::size_of::<Archived<Packet>>() }]);
+                    let mut serializer = BufferSerializer::new(buf);
+                    serializer.serialize_value(&packet)?;
+                    let bytes = Bytes::from(serializer.into_inner());
 
-                let mut to_remove = Vec::new();
-                for (connection_id, connection) in connections.iter() {
-                    if let Err(e) = connection.send_datagram(bytes.clone()) {
-                        error!("error sending datagram: {}", e);
-                        to_remove.push(*connection_id);
+                    let mut to_remove = Vec::new();
+                    for (connection_id, connection) in connections.iter() {
+                        if let Err(e) = connection.send_datagram(bytes.clone()) {
+                            error!("error sending datagram: {}", e);
+                            to_remove.push(*connection_id);
+                        }
+                    }
+                    for id in to_remove {
+                        connections.remove(&id);
                     }
                 }
-                for id in to_remove {
-                    connections.remove(&id);
-                }
             }
+        }
+
+        // reset after all connections drop
+        if connections.len() == 0 {
+            playback_state = PlaybackState::Stopped;
         }
     }
 }

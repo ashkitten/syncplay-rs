@@ -41,13 +41,6 @@ pub enum Packet {
         #[with(ArchivedDuration)]
         elapsed: Duration,
     },
-    PlaybackStart {
-        #[with(ArchivedDuration)]
-        timestamp: Duration,
-        paused: bool,
-        #[with(ArchivedDuration)]
-        elapsed: Duration,
-    },
 }
 
 impl Packet {
@@ -198,4 +191,10 @@ pub async fn run_connection(
     });
 
     (stream, connection)
+}
+
+pub enum PlaybackState {
+    Stopped,
+    Playing { start: Instant },
+    Paused { elapsed: Duration },
 }
