@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
 use log::{error, info};
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint, SendStream};
 use rkyv::{
     ser::{serializers::BufferSerializer, Serializer},
     Archived,
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     }
 
     async fn transition_state(
-        connection: &Connection,
+        send: &mut SendStream,
         syncer: &TimeSyncer,
         state: &PlaybackState,
         new_state: &PlaybackState,
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                     elapsed: *elapsed,
                 },
             };
-            packet.write_into(&mut send).await?;
+            packet.write_into(send).await?;
         }
 
         Ok(())
@@ -205,7 +205,7 @@ async fn main() -> Result<()> {
             event = events.recv() => {
                 dbg!(&event);
                 let new_state = get_playback_state(&mut mpv).await;
-                transition_state(&connection, &syncer, &playback_state, &new_state).await?;
+                transition_state(&mut send, &syncer, &playback_state, &new_state).await?;
                 playback_state = new_state;
             },
 
