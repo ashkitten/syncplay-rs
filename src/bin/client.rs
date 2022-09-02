@@ -2,18 +2,21 @@ use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
 use log::{error, info};
-use quinn::{ClientConfig, Connection, Endpoint, SendStream};
+use quinn::{ClientConfig, Endpoint, SendStream};
 use rkyv::{
     ser::{serializers::BufferSerializer, Serializer},
     Archived,
 };
 use serde_json::Value;
-use std::{mem, sync::Arc};
+use std::{
+    mem,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use syncplay_rs::{
     mpv::{Command, LoadFileOptions, Mpv, SeekOptions},
     run_connection, Packet, PlaybackState, TimeSyncer,
 };
-use time::{Duration, Instant};
 use tokio::{select, time::MissedTickBehavior};
 use tokio_stream::StreamExt;
 
@@ -59,7 +62,7 @@ async fn main() -> Result<()> {
 
     let mut events = mpv.listen_events();
 
-    mpv.send_command(Command::Observe(2, "pause")).await?;
+    mpv.send_command(Command::Observe(1, "pause")).await?;
 
     while mpv
         .send_command(Command::LoadFile(
@@ -77,7 +80,7 @@ async fn main() -> Result<()> {
             .send_command(Command::GetProperty("playback-time"))
             .await
         {
-            let time = Duration::seconds_f64(time.as_f64().unwrap());
+            let time = Duration::from_secs_f64(time.as_f64().unwrap());
             if let Ok(Value::Bool(paused)) = mpv.send_command(Command::GetProperty("pause")).await {
                 if paused {
                     return PlaybackState::Paused { elapsed: time };
@@ -108,7 +111,9 @@ async fn main() -> Result<()> {
             PlaybackState::Playing { start } => match new_state {
                 PlaybackState::Stopped => true,
                 PlaybackState::Playing { start: new_start } => {
-                    (*start - *new_start).abs() > Duration::seconds(2)
+                    let start = time::Instant::try_from(*start).unwrap();
+                    let new_start = time::Instant::try_from(*new_start).unwrap();
+                    (start - new_start).abs() > time::Duration::seconds(2)
                 }
                 PlaybackState::Paused { .. } => true,
             },
@@ -118,7 +123,11 @@ async fn main() -> Result<()> {
                 PlaybackState::Playing { .. } => true,
                 PlaybackState::Paused {
                     elapsed: new_elapsed,
-                } => (*elapsed - *new_elapsed).abs() > Duration::seconds(2),
+                } => {
+                    let elapsed = time::Duration::try_from(*elapsed).unwrap();
+                    let new_elapsed = time::Duration::try_from(*new_elapsed).unwrap();
+                    (elapsed - new_elapsed).abs() > time::Duration::seconds(2)
+                }
             },
         };
 
@@ -151,26 +160,27 @@ async fn main() -> Result<()> {
 
                 match packet {
                     Packet::PlaybackControl { timestamp, paused, elapsed } => {
-                        info!("PlaybackControl {{ paused: {paused}, elapsed: {elapsed} }}");
+                        info!("PlaybackControl {{ paused: {:#?}, elapsed: {:#?} }}", paused, elapsed);
                         let latency = syncer.since(timestamp);
-                        let time = elapsed - latency;
+                        let time: Duration = (elapsed - latency).try_into().unwrap_or_default();
 
                         match playback_state {
                             PlaybackState::Stopped => {
-                                while let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                while let Err(e) = mpv.send_command(Command::Seek(time.as_secs_f64(), SeekOptions::Absolute)).await {
                                     error!("error seeking: {}", e);
                                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 }
                             }
                             PlaybackState::Playing { start } => {
-                                if (start.elapsed() - time).abs() < Duration::seconds(2) {
-                                    if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                let start = time::Instant::try_from(start).unwrap();
+                                if (start.elapsed() - time).abs() < time::Duration::seconds(2) {
+                                    if let Err(e) = mpv.send_command(Command::Seek(time.as_secs_f64(), SeekOptions::Absolute)).await {
                                         error!("error seeking: {}", e);
                                     }
                                 }
                             }
                             PlaybackState::Paused { .. } => {
-                                if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
+                                if let Err(e) = mpv.send_command(Command::Seek(time.as_secs_f64(), SeekOptions::Absolute)).await {
                                     error!("error seeking: {}", e);
                                 }
                             }
@@ -192,7 +202,7 @@ async fn main() -> Result<()> {
                             let time = elapsed - latency;
 
                             // TODO: slow down/speed up to resync smaller intervals
-                            if drift.abs() > Duration::seconds(2) {
+                            if drift.abs() > Duration::from_secs(2) {
                                 if let Err(e) = mpv.send_command(Command::Seek(time.as_seconds_f64(), SeekOptions::Absolute)).await {
                                     error!("error seeking: {}", e);
                                 }

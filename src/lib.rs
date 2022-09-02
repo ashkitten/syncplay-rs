@@ -2,13 +2,11 @@ use anyhow::Error;
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use quinn::{Connection, NewConnection};
-use rkyv::{
-    to_archived,
-    with::{ArchiveWith, DeserializeWith, SerializeWith},
-    AlignedBytes, Archive, Archived, Deserialize, Fallible, Serialize,
+use rkyv::{AlignedBytes, Archive, Archived, Deserialize, Serialize};
+use std::{
+    io, mem,
+    time::{Duration, Instant, SystemTime},
 };
-use std::{io, mem, ptr::addr_of_mut};
-use time::{Duration, Instant, OffsetDateTime};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -22,23 +20,18 @@ pub mod mpv;
 pub enum Packet {
     Version(u8),
     TimeSyncRequest,
-    TimeSyncResponse(#[with(ArchivedDuration)] Duration),
+    TimeSyncResponse(Duration),
     MediaInfo {
         name: String,
-        #[with(ArchivedDuration)]
         duration: Duration,
     },
     PlaybackUpdate {
-        #[with(ArchivedDuration)]
         timestamp: Duration,
-        #[with(ArchivedDuration)]
         elapsed: Duration,
     },
     PlaybackControl {
-        #[with(ArchivedDuration)]
         timestamp: Duration,
         paused: bool,
-        #[with(ArchivedDuration)]
         elapsed: Duration,
     },
 }
@@ -83,7 +76,7 @@ impl Decoder for PacketDecoder {
 
 pub struct TimeSyncer {
     epoch: Instant,
-    offset: Duration,
+    offset: time::Duration,
     sync_start: Instant,
     rtt_samples: Vec<Duration>,
 }
@@ -91,8 +84,8 @@ pub struct TimeSyncer {
 impl TimeSyncer {
     pub fn new() -> Self {
         Self {
-            epoch: Instant::now() - (OffsetDateTime::now_utc() - OffsetDateTime::UNIX_EPOCH),
-            offset: Duration::ZERO,
+            epoch: Instant::now() - SystemTime::UNIX_EPOCH.elapsed().unwrap(),
+            offset: time::Duration::ZERO,
             sync_start: Instant::now(),
             rtt_samples: Vec::with_capacity(10),
         }
@@ -100,7 +93,7 @@ impl TimeSyncer {
 
     pub fn start_sync(&mut self) {
         self.sync_start = Instant::now();
-        self.epoch = self.sync_start - (OffsetDateTime::now_utc() - OffsetDateTime::UNIX_EPOCH);
+        self.epoch = self.sync_start - SystemTime::UNIX_EPOCH.elapsed().unwrap();
     }
 
     pub fn finish_sync(&mut self, since_epoch: Duration) {
@@ -108,51 +101,19 @@ impl TimeSyncer {
         self.rtt_samples.truncate(10);
         let avg_rtt: Duration =
             self.rtt_samples.iter().sum::<Duration>() / self.rtt_samples.len() as u32;
-        self.offset = since_epoch - (self.sync_start - self.epoch) + avg_rtt / 2;
+        self.offset = (since_epoch - (self.sync_start - self.epoch) + avg_rtt / 2)
+            .try_into()
+            .unwrap();
     }
 
     pub fn since(&self, timestamp: Duration) -> Duration {
-        self.epoch.elapsed() + self.offset - timestamp
+        (self.epoch.elapsed() + self.offset - timestamp)
+            .try_into()
+            .unwrap_or_default()
     }
 
     pub fn now(&self) -> Duration {
-        self.epoch.elapsed() + self.offset
-    }
-}
-
-pub struct ArchivedDuration {
-    seconds: i64,
-    nanoseconds: i32,
-}
-
-impl ArchiveWith<Duration> for ArchivedDuration {
-    type Archived = ArchivedDuration;
-    type Resolver = ();
-
-    #[inline]
-    unsafe fn resolve_with(
-        field: &Duration,
-        _pos: usize,
-        _resolver: Self::Resolver,
-        out: *mut Self::Archived,
-    ) {
-        addr_of_mut!((*out).seconds).write(to_archived!(field.whole_seconds()));
-        addr_of_mut!((*out).nanoseconds).write(to_archived!(field.subsec_nanoseconds()));
-    }
-}
-
-impl<S: Fallible + ?Sized> SerializeWith<Duration, S> for ArchivedDuration {
-    fn serialize_with(_field: &Duration, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
-        Ok(())
-    }
-}
-
-impl<D: Fallible + ?Sized> DeserializeWith<ArchivedDuration, Duration, D> for ArchivedDuration {
-    fn deserialize_with(
-        field: &ArchivedDuration,
-        _deserializer: &mut D,
-    ) -> Result<Duration, D::Error> {
-        Ok(Duration::new(field.seconds, field.nanoseconds))
+        (self.epoch.elapsed() + self.offset).try_into().unwrap()
     }
 }
 

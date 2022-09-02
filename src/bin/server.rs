@@ -6,7 +6,7 @@ use rkyv::{
     ser::{serializers::BufferSerializer, Serializer},
     Archived,
 };
-use std::{collections::HashMap, mem};
+use std::{collections::HashMap, mem, time::Duration};
 use syncplay_rs::{run_connection, Packet, PlaybackState, TimeSyncer};
 use time::Instant;
 use tokio::{select, time::MissedTickBehavior};
@@ -77,13 +77,14 @@ async fn main() -> Result<()> {
                         elapsed,
                     } => {
                         let latency = syncer.since(timestamp);
+                        dbg!(&latency);
 
                         playback_state = match paused {
                             false => PlaybackState::Playing {
-                                start: Instant::now() - (elapsed + latency),
+                                start: (Instant::now() - (elapsed + latency)).try_into().unwrap(),
                             },
                             true => PlaybackState::Paused {
-                                elapsed: elapsed + latency,
+                                elapsed: (elapsed + latency).try_into().unwrap_or_default(),
                             },
                         };
 
